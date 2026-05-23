@@ -8,46 +8,32 @@
 用途：
   当屏幕大于 1x1 时，例如 width_maps=3, height_maps=2，
   01 会输出 384x256 的大帧：
-    big_frames/frame_00001.png
-    big_frames/frame_00002.png
+    in/frame_00001.png
+    in/frame_00002.png
     ...
 
   04 会把每张大帧按“从左到右、从上到下”的顺序切成 128x128 tile，
   并输出为一条线性的 frame_*.png 序列，方便 02_gen_map_dat.py 原样读取。
 
-示例：
-  3x2 屏幕，每帧 6 个 tile。
+推荐工作流：
+  直接把 tile 输出回 in/，这样下一步 02 可以继续读取 in/，不用手动覆盖：
+    python 04_split_tiles.py --input in --width-maps 3 --height-maps 2 --replace-input --yes
 
-  原 frame_00001.png 会输出：
-    frame_000001.png  # tile 0，左上
-    frame_000002.png  # tile 1
-    frame_000003.png  # tile 2
-    frame_000004.png  # tile 3
-    frame_000005.png  # tile 4
-    frame_000006.png  # tile 5，右下
+  使用 --replace-input 时，04 会先把原来的大帧移动到备份目录，例如 in_big_frames/，
+  然后把切好的 tile 序列写回 in/。
 
-  原 frame_00002.png 会继续输出：
-    frame_000007.png
-    frame_000008.png
-    ...
-
-依赖：
-  Pillow：pip install pillow
-
-用法：
-  直接运行：
-    python 04_split_tiles.py
-
-  命令行：
+普通工作流：
     python 04_split_tiles.py --input in --output tiles --width-maps 3 --height-maps 2 --yes
 
 后续：
-  python 02_gen_map_dat.py --input tiles ...
+  python 02_gen_map_dat.py --input in ...      # replace-input 模式
+  python 02_gen_map_dat.py --input tiles ...   # 普通输出模式
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 from pathlib import Path
 
 from PIL import Image
@@ -107,6 +93,41 @@ def list_input_frames(input_dir: Path) -> list[Path]:
     if not frames:
         raise FileNotFoundError(f"输入目录里没有找到 frame_*.png：{input_dir}")
     return frames
+
+
+def unique_backup_dir(input_dir: Path, requested_backup_dir: Path | None = None) -> Path:
+    """
+    返回一个不会覆盖已有内容的备份目录。
+    默认：in -> in_big_frames；如果已存在，则自动追加 _2、_3 ...
+    """
+    if requested_backup_dir is not None:
+        base = requested_backup_dir
+    else:
+        base = input_dir.with_name(f"{input_dir.name}_big_frames")
+
+    if not base.exists():
+        return base
+
+    index = 2
+    while True:
+        candidate = base.with_name(f"{base.name}_{index}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def move_input_frames_to_backup(input_dir: Path, backup_dir: Path) -> Path:
+    """
+    把 input_dir 里的 frame_*.png 移动到 backup_dir。
+    这样 output_dir 可以安全地继续使用原 input_dir，方便 02 直接读取。
+    """
+    frames = list_input_frames(input_dir)
+    backup_dir.mkdir(parents=True, exist_ok=False)
+
+    for frame in frames:
+        shutil.move(str(frame), str(backup_dir / frame.name))
+
+    return backup_dir
 
 
 def split_one_frame(
@@ -187,6 +208,8 @@ def main() -> None:
     parser.add_argument("--output", "-o", default="tiles", help="输出 tile 目录，默认 tiles")
     parser.add_argument("--width-maps", type=int, default=1, help="屏幕宽度，单位为地图/展示框，默认 1")
     parser.add_argument("--height-maps", type=int, default=1, help="屏幕高度，单位为地图/展示框，默认 1")
+    parser.add_argument("--replace-input", action="store_true", help="把原输入大帧备份后，将 tile 序列输出回输入目录，方便 02 直接读取")
+    parser.add_argument("--backup-dir", default=None, help="replace-input 模式的大帧备份目录，默认 input_big_frames")
     parser.add_argument("--no-clear", action="store_true", help="不清空输出目录旧 PNG")
     parser.add_argument("--yes", action="store_true", help="非交互模式，直接使用参数")
     args = parser.parse_args()
@@ -197,16 +220,50 @@ def main() -> None:
         print()
 
         args.input = ask_str("输入大帧目录", args.input)
-        args.output = ask_str("输出 tile 目录", args.output)
         args.width_maps = ask_int("屏幕宽度 width，单位为地图/展示框", args.width_maps)
         args.height_maps = ask_int("屏幕高度 height，单位为地图/展示框", args.height_maps)
-        clear = ask_bool("生成前清空输出目录里的旧 PNG", not args.no_clear)
-        args.no_clear = not clear
+
+        if args.width_maps == 1 and args.height_maps == 1:
+            print()
+            print("检测到屏幕尺寸是 1x1，其实不需要运行 04。")
+            still_run = ask_bool("仍然继续切分", False)
+            if not still_run:
+                return
+
+        args.replace_input = ask_bool("把 tile 直接输出回输入目录，方便 02 继续读取", True)
+        if args.replace_input:
+            args.output = args.input
+            args.backup_dir = ask_str("原大帧备份目录", f"{Path(args.input).name}_big_frames")
+            args.no_clear = False
+        else:
+            args.output = ask_str("输出 tile 目录", args.output)
+            clear = ask_bool("生成前清空输出目录里的旧 PNG", not args.no_clear)
+            args.no_clear = not clear
         print()
 
+    input_dir = Path(args.input)
+    output_dir = Path(args.output)
+
+    if args.replace_input:
+        requested_backup_dir = Path(args.backup_dir) if args.backup_dir else None
+        if requested_backup_dir is not None and not requested_backup_dir.is_absolute():
+            requested_backup_dir = input_dir.parent / requested_backup_dir
+
+        backup_dir = unique_backup_dir(input_dir, requested_backup_dir)
+        print()
+        print("replace-input 模式：")
+        print(f"原大帧将备份到：{backup_dir}")
+        print(f"tile 序列将输出到：{input_dir}")
+        print()
+
+        input_dir = move_input_frames_to_backup(input_dir, backup_dir)
+        output_dir = Path(args.input)
+        # 原 frame_*.png 已经移走，可以正常写回输入目录。
+        args.no_clear = False
+
     split_all_frames(
-        input_dir=Path(args.input),
-        output_dir=Path(args.output),
+        input_dir=input_dir,
+        output_dir=output_dir,
         width_maps=args.width_maps,
         height_maps=args.height_maps,
         clear=not args.no_clear,

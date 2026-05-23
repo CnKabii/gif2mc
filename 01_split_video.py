@@ -13,12 +13,14 @@
   模式：pad，保持完整画面，补边到目标尺寸
 
 多展示框：
-  width_maps=3, height_maps=2 时，输出大帧尺寸为 384x256。
-  后续可交给 04_split_tiles.py 再切成有序 128x128 tile 图片序列。
+  width_maps=3, height_maps=2 时，ffmpeg 会先输出 384x256 大帧到 temp/。
+  然后本工具会自动用 Pillow 把大帧切成有序 128x128 tile，最终输出到 in/。
+  因此后续 02_gen_map_dat.py 仍然可以直接读取 in/，不需要手动搬运 tile。
 
 依赖：
   1. 安装 ffmpeg，并确保 ffmpeg 在 PATH 里
   2. Python 3.8+
+  3. 多展示框模式需要 Pillow：pip install pillow
 
 用法：
   直接运行：
@@ -27,6 +29,10 @@
   也支持命令行：
     python 01_split_video.py --input video.mp4 --fps 10 --mode pad
     python 01_split_video.py --input video.mp4 --fps 12 --mode crop --width-maps 3 --height-maps 2
+
+  大屏模式下：
+    temp/ 保存大帧序列
+    in/   保存最终给 02 使用的 128x128 tile 序列
 """
 
 from __future__ import annotations
@@ -35,6 +41,9 @@ import argparse
 import shutil
 import subprocess
 from pathlib import Path
+
+
+TILE_SIZE = 128
 
 
 def ask_str(prompt: str, default: str | None = None) -> str:
@@ -148,9 +157,89 @@ def clear_old_frames(output_dir: Path) -> None:
             p.unlink()
 
 
+def list_frame_files(input_dir: Path) -> list[Path]:
+    frames = sorted(input_dir.glob("frame_*.png"))
+    if not frames:
+        raise FileNotFoundError(f"没有在 {input_dir} 里找到 frame_*.png")
+    return frames
+
+
+def split_big_frames_to_tiles(
+    input_dir: Path,
+    output_dir: Path,
+    width_maps: int,
+    height_maps: int,
+    clear: bool,
+) -> int:
+    """
+    把大帧序列切成线性的 128x128 tile 序列。
+
+    输出命名仍然是 frame_000001.png、frame_000002.png ...
+    这样 02_gen_map_dat.py 可以原样读取，不需要理解大屏幕结构。
+    """
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError(
+            "多展示框模式需要 Pillow。\n"
+            "请先运行：pip install pillow"
+        ) from exc
+
+    frames = list_frame_files(input_dir)
+    expected_width = width_maps * TILE_SIZE
+    expected_height = height_maps * TILE_SIZE
+    tile_count = width_maps * height_maps
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if clear:
+        clear_old_frames(output_dir)
+
+    print()
+    print("开始切 tile：")
+    print(f"大帧目录：{input_dir}")
+    print(f"最终输出：{output_dir}")
+    print(f"屏幕尺寸：{width_maps}x{height_maps}")
+    print(f"每帧 tile 数：{tile_count}")
+    print()
+
+    next_index = 1
+    for frame_no, frame_path in enumerate(frames, start=1):
+        with Image.open(frame_path) as img:
+            img = img.convert("RGB")
+            if img.size != (expected_width, expected_height):
+                raise ValueError(
+                    f"{frame_path.name} 尺寸不匹配："
+                    f"期望 {expected_width}x{expected_height}，"
+                    f"实际 {img.size[0]}x{img.size[1]}。"
+                )
+
+            for row in range(height_maps):
+                for col in range(width_maps):
+                    left = col * TILE_SIZE
+                    top = row * TILE_SIZE
+                    tile = img.crop((left, top, left + TILE_SIZE, top + TILE_SIZE))
+                    tile.save(output_dir / f"frame_{next_index:06d}.png")
+                    next_index += 1
+
+        if frame_no == 1 or frame_no == len(frames) or frame_no % 50 == 0:
+            print(f"已切 tile：{frame_no}/{len(frames)}，当前大帧 {frame_path.name}")
+
+    output_frames = sorted(output_dir.glob("frame_*.png"))
+    print()
+    print("tile 切分完成。")
+    print(f"大帧数量：{len(frames)}")
+    print(f"tile 图片数：{len(output_frames)}")
+    if output_frames:
+        print(f"第一张：{output_frames[0].name}")
+        print(f"最后一张：{output_frames[-1].name}")
+
+    return len(output_frames)
+
+
 def run_ffmpeg(
     input_path: Path,
     output_dir: Path,
+    temp_dir: Path,
     fps: float,
     mode: str,
     clear: bool,
@@ -164,15 +253,23 @@ def run_ffmpeg(
     if not input_path.exists():
         raise FileNotFoundError(f"找不到输入文件：{input_path}")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if clear:
-        clear_old_frames(output_dir)
-
-    target_width = width_maps * 128
-    target_height = height_maps * 128
+    is_multiscreen = width_maps > 1 or height_maps > 1
+    target_width = width_maps * TILE_SIZE
+    target_height = height_maps * TILE_SIZE
     vf = build_filter(fps, mode, contrast, saturation, target_width, target_height)
-    output_pattern = output_dir / "frame_%05d.png"
+
+    if is_multiscreen:
+        if output_dir.resolve() == temp_dir.resolve():
+            raise ValueError("大屏模式下 output 目录不能和 temp 目录相同。")
+        ffmpeg_output_dir = temp_dir
+    else:
+        ffmpeg_output_dir = output_dir
+
+    ffmpeg_output_dir.mkdir(parents=True, exist_ok=True)
+    if clear:
+        clear_old_frames(ffmpeg_output_dir)
+
+    output_pattern = ffmpeg_output_dir / "frame_%05d.png"
 
     cmd = [
         ffmpeg,
@@ -184,31 +281,52 @@ def run_ffmpeg(
 
     print()
     print(f"展示框屏幕：{width_maps}x{height_maps}")
-    print(f"输出帧尺寸：{target_width}x{target_height}")
+    print(f"ffmpeg 输出帧尺寸：{target_width}x{target_height}")
+    if is_multiscreen:
+        print(f"大帧临时目录：{temp_dir}")
+        print(f"最终 tile 目录：{output_dir}")
+    else:
+        print(f"输出目录：{output_dir}")
     print("即将执行 ffmpeg：")
     print(" ".join(f'"{x}"' if " " in x else x for x in cmd))
     print()
 
     subprocess.run(cmd, check=True)
 
-    frames = sorted(output_dir.glob("frame_*.png"))
+    big_frames = sorted(ffmpeg_output_dir.glob("frame_*.png"))
     print()
-    print("完成。")
-    print(f"输出目录：{output_dir}")
-    print(f"生成帧数：{len(frames)}")
-    if frames:
-        print(f"第一帧：{frames[0].name}")
-        print(f"最后一帧：{frames[-1].name}")
-    if width_maps > 1 or height_maps > 1:
+    print("ffmpeg 完成。")
+    print(f"ffmpeg 输出目录：{ffmpeg_output_dir}")
+    print(f"生成帧数：{len(big_frames)}")
+    if big_frames:
+        print(f"第一帧：{big_frames[0].name}")
+        print(f"最后一帧：{big_frames[-1].name}")
+
+    if is_multiscreen:
+        split_big_frames_to_tiles(
+            input_dir=temp_dir,
+            output_dir=output_dir,
+            width_maps=width_maps,
+            height_maps=height_maps,
+            clear=clear,
+        )
         print()
-        print("提示：当前输出的是大帧序列。")
-        print("下一步可以运行 04_split_tiles.py，把大帧切成有序 128x128 tile 序列。")
+        print("完成。")
+        print(f"大帧保存在：{temp_dir}")
+        print(f"最终 128x128 tile 序列已输出到：{output_dir}")
+        print("下一步可以直接运行 02_gen_map_dat.py。")
+    else:
+        print()
+        print("完成。")
+        print(f"最终 128x128 帧序列已输出到：{output_dir}")
+        print("下一步可以直接运行 02_gen_map_dat.py。")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="用 ffmpeg 一键切分视频/GIF 到 in/frame_*.png")
     parser.add_argument("--input", "-i", help="输入视频/GIF 文件路径")
-    parser.add_argument("--output", "-o", default="in", help="输出文件夹，默认 in")
+    parser.add_argument("--output", "-o", default="in", help="最终输出文件夹，默认 in；大屏模式下这里会保存 128x128 tile 序列")
+    parser.add_argument("--temp", default="temp", help="大屏模式下的大帧临时输出文件夹，默认 temp")
     parser.add_argument("--fps", type=float, default=10, help="每秒输出帧数，默认 10")
     parser.add_argument("--mode", choices=["pad", "crop"], default="pad", help="pad=保留完整画面补边；crop=铺满裁剪")
     parser.add_argument("--width-maps", type=int, default=1, help="屏幕宽度，单位为地图/展示框，默认 1")
@@ -220,7 +338,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.yes:
-        print("=== 视频/GIF 切帧工具：ffmpeg -> in/frame_*.png ===")
+        print("=== 视频/GIF 切帧工具：ffmpeg -> in/frame_*.png / 大屏自动 tile ===")
         print("直接回车使用方括号里的默认值。")
         print()
 
@@ -232,7 +350,9 @@ def main() -> None:
         args.fps = ask_float("fps，每秒切几帧", args.fps)
         args.width_maps = ask_int("屏幕宽度 width，单位为地图/展示框", args.width_maps)
         args.height_maps = ask_int("屏幕高度 height，单位为地图/展示框", args.height_maps)
-        print(f"目标大帧尺寸：{args.width_maps * 128}x{args.height_maps * 128}")
+        print(f"目标大帧尺寸：{args.width_maps * TILE_SIZE}x{args.height_maps * TILE_SIZE}")
+        if args.width_maps > 1 or args.height_maps > 1:
+            args.temp = ask_str("大帧临时输出目录 temp", args.temp)
         args.mode = ask_mode(args.mode)
 
         use_enhance = ask_bool("是否增强对比度/饱和度（地图画可能更清楚）", False)
@@ -252,6 +372,7 @@ def main() -> None:
     run_ffmpeg(
         input_path=Path(args.input),
         output_dir=Path(args.output),
+        temp_dir=Path(args.temp),
         fps=args.fps,
         mode=args.mode,
         clear=not args.no_clear,
