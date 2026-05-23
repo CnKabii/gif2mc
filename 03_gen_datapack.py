@@ -106,6 +106,35 @@ def get_continuous_map_ids(all_ids: list[int], start_map: int) -> list[int]:
 
 
 # =========================
+# 大屏幕坐标 / tile 规则
+# =========================
+
+def validate_screen_size(width_maps: int, height_maps: int):
+    if width_maps < 1 or height_maps < 1:
+        raise ValueError("width_maps 和 height_maps 必须都大于等于 1。")
+
+
+def get_tile_position(tile_index: int, width_maps: int, height_maps: int, x: int, y: int, z: int) -> tuple[int, int, int]:
+    """
+    tile 顺序：从左到右，从上到下。
+
+    x/y/z 作为屏幕左下角支撑方块坐标。
+    这样 1x1 时仍然是原来的 x y z。
+    例如 3x2：
+      tile_0 tile_1 tile_2   -> y + 1
+      tile_3 tile_4 tile_5   -> y
+    """
+    row = tile_index // width_maps
+    col = tile_index % width_maps
+
+    tile_x = x + col
+    tile_y = y + (height_maps - 1 - row)
+    tile_z = z
+
+    return tile_x, tile_y, tile_z
+
+
+# =========================
 # datapack 生成
 # =========================
 
@@ -166,6 +195,8 @@ def generate_basic_functions(
     z: int,
     frame_delay: int,
     use_glow_frame: bool,
+    width_maps: int,
+    height_maps: int,
 ):
     """
     生成 mcfunction 文件。
@@ -175,11 +206,17 @@ def generate_basic_functions(
 
     内部函数全部放入 internal/：
     load / tick / next / load_frame / init_next / init_finish
+
+    大屏幕规则：
+    - width_maps * height_maps = 每帧 tile 数量
+    - map_id = start_map + frame_index * tile_count + tile_index
+    - tile 顺序固定为从左到右、从上到下
     """
     function_dir = datapack_dir / "data" / namespace / "function"
     internal_dir = function_dir / "internal"
 
     frame_entity = "minecraft:glow_item_frame" if use_glow_frame else "minecraft:item_frame"
+    tile_count = width_maps * height_maps
 
     # internal/load.mcfunction
     load_content = f"""# {namespace}:internal/load
@@ -193,27 +230,43 @@ scoreboard objectives add {namespace}.frame dummy
 """
 
     # setup.mcfunction
-    setup_content = f"""# {namespace}:setup
-# 用户函数：初始化展示框和播放状态
+    setup_lines = [
+        f"# {namespace}:setup",
+        "# 用户函数：初始化展示框和播放状态",
+        "",
+        f"function {namespace}:internal/load",
+        "",
+        f"scoreboard players set #playing {namespace}.state 0",
+        f"scoreboard players set #timer {namespace}.timer 0",
+        f"scoreboard players set #frame {namespace}.frame 0",
+        "",
+        f"# 屏幕尺寸：{width_maps} x {height_maps}，每帧 {tile_count} 张地图",
+        "# x/y/z 是屏幕左下角支撑方块坐标",
+        "",
+        "# 清理旧展示框",
+        f"kill @e[type={frame_entity},tag={namespace}.screen]",
+        "",
+        "# 生成支撑方块和展示框",
+        "# tile 顺序：从左到右，从上到下",
+        "# 注意：Facing 方向后面可能需要根据实际朝向调整",
+    ]
 
-function {namespace}:internal/load
+    for tile_index in range(tile_count):
+        tile_x, tile_y, tile_z = get_tile_position(tile_index, width_maps, height_maps, x, y, z)
+        initial_map_id = start_map + tile_index
+        setup_lines.append(f"setblock {tile_x} {tile_y} {tile_z} minecraft:barrier")
+        setup_lines.append(
+            f'summon {frame_entity} {tile_x} {tile_y} {tile_z + 1} '
+            f'{{Tags:["{namespace}.screen","{namespace}.tile_{tile_index}"],Facing:3b,'
+            f'Item:{{id:"minecraft:filled_map",count:1,components:{{"minecraft:map_id":{initial_map_id}}}}}}}'
+        )
 
-scoreboard players set #playing {namespace}.state 0
-scoreboard players set #timer {namespace}.timer 0
-scoreboard players set #frame {namespace}.frame 0
-
-# 放一个屏障作为展示框支撑
-setblock {x} {y} {z} minecraft:barrier
-
-# 清理旧展示框
-kill @e[type={frame_entity},tag={namespace}.screen]
-
-# 生成展示框
-# 注意：Facing 方向后面可能需要根据实际朝向调整
-summon {frame_entity} {x} {y} {z + 1} {{Tags:["{namespace}.screen"],Facing:3b,Item:{{id:"minecraft:filled_map",count:1,components:{{"minecraft:map_id":{start_map}}}}}}}
-
-function {namespace}:internal/load_frame
-"""
+    setup_lines.extend([
+        "",
+        f"function {namespace}:internal/load_frame",
+        "",
+    ])
+    setup_content = "\n".join(setup_lines)
 
     # init.mcfunction：2 FPS 预载
     init_content = f"""# {namespace}:init
@@ -228,7 +281,7 @@ scoreboard players set #init_delay {namespace}.timer 10
 function {namespace}:internal/load_frame
 """
 
-    # init_f.mcfunction：4 FPS 预载
+    # init_f.mcfunction：5 FPS 预载
     init_f_content = f"""# {namespace}:init_f
 # 用户函数：快速预载所有地图，默认 5 FPS
 # 效果：从第一帧较快播放一次，结束后回到第一帧并暂停
@@ -322,18 +375,21 @@ function {namespace}:internal/load_frame
     # internal/load_frame.mcfunction
     lines = [
         f"# {namespace}:internal/load_frame",
-        "# 内部函数：根据当前 #frame，把展示框里的 filled_map 切换到对应 map_id",
+        "# 内部函数：根据当前 #frame，把所有展示框里的 filled_map 切换到对应 map_id",
+        f"# map_id = {start_map} + frame_index * {tile_count} + tile_index",
+        "# tile 顺序：从左到右，从上到下",
         ""
     ]
 
     for frame_index in range(frame_count):
-        map_id = start_map + frame_index
-        line = (
-            f'execute if score #frame {namespace}.frame matches {frame_index} '
-            f'run data merge entity @e[type={frame_entity},tag={namespace}.screen,limit=1,sort=nearest] '
-            f'{{Item:{{id:"minecraft:filled_map",count:1,components:{{"minecraft:map_id":{map_id}}}}}}}'
-        )
-        lines.append(line)
+        for tile_index in range(tile_count):
+            map_id = start_map + frame_index * tile_count + tile_index
+            line = (
+                f'execute if score #frame {namespace}.frame matches {frame_index} '
+                f'run data merge entity @e[type={frame_entity},tag={namespace}.tile_{tile_index},limit=1,sort=nearest] '
+                f'{{Item:{{id:"minecraft:filled_map",count:1,components:{{"minecraft:map_id":{map_id}}}}}}}'
+            )
+            lines.append(line)
 
     load_frame_content = "\n".join(lines) + "\n"
 
@@ -363,12 +419,21 @@ def make_output_readme(config: dict) -> str:
 - Minecraft: {config['minecraft']}
 - namespace: {namespace}
 - map 范围: map_{config['start_map']}.dat ~ map_{config['end_map']}.dat
+- 屏幕尺寸: {config['width_maps']} x {config['height_maps']} 展示框
+- 每帧地图数量: {config['tile_count']}
 - 帧数量: {config['frame_count']}
 - 播放 frame-delay: {config['frame_delay']} tick
 - init: 2 FPS 预载，扫完后回到第一帧并暂停
 - init_f: 5 FPS 预载，扫完后回到第一帧并暂停
-- 展示框支撑方块坐标: {config['x']} {config['y']} {config['z']}
+- 屏幕左下角支撑方块坐标: {config['x']} {config['y']} {config['z']}
 - 展示框类型: {config['frame_entity']}
+
+大屏幕 map_id 规则
+- tile 顺序：从左到右，从上到下
+- 第 frame 帧、第 tile 块：map_id = start_map + frame * tile_count + tile
+- 例如 3x2 屏幕：
+  tile_0 tile_1 tile_2
+  tile_3 tile_4 tile_5
 
 放置方式
 1. 把 world data 目录里的 map_*.dat 和 idcounts.dat 复制到世界存档的 data 文件夹。
@@ -398,7 +463,9 @@ restart 从第一帧重新开始正常播放
 调试提示
 如果 /reload 没报错，但画面不动，先确认 world data 已经复制到世界 data 文件夹。
 如果 setup 没生成展示框，检查坐标附近是否被方块或实体占用。
+如果大屏幕顺序错位，先确认 04_split_tiles.py 输出顺序是从左到右、从上到下的线性 frame_*.png 序列。
 """
+
 
 def generate_datapack(
     world_data_dir: Path,
@@ -411,8 +478,13 @@ def generate_datapack(
     frame_delay: int,
     use_glow_frame: bool,
     overwrite: bool,
+    width_maps: int = 1,
+    height_maps: int = 1,
     meta_dir: Path | None = None,
 ):
+    validate_screen_size(width_maps, height_maps)
+    tile_count = width_maps * height_maps
+
     all_ids = scan_map_ids(world_data_dir)
 
     if not all_ids:
@@ -425,8 +497,15 @@ def generate_datapack(
             f"没有找到从 map_{start_map}.dat 开始的连续地图文件。"
         )
 
-    frame_count = len(continuous_ids)
-    end_map = continuous_ids[-1]
+    if len(continuous_ids) < tile_count:
+        raise RuntimeError(
+            f"连续地图数量不足。当前从 map_{start_map}.dat 开始只找到 {len(continuous_ids)} 张，"
+            f"但 {width_maps}x{height_maps} 屏幕至少需要 {tile_count} 张。"
+        )
+
+    usable_map_count = (len(continuous_ids) // tile_count) * tile_count
+    frame_count = usable_map_count // tile_count
+    end_map = start_map + usable_map_count - 1
 
     unused_ids = [map_id for map_id in all_ids if map_id > end_map]
 
@@ -458,17 +537,25 @@ def generate_datapack(
         z=z,
         frame_delay=frame_delay,
         use_glow_frame=use_glow_frame,
+        width_maps=width_maps,
+        height_maps=height_maps,
     )
+
+    frame_entity = "minecraft:glow_item_frame" if use_glow_frame else "minecraft:item_frame"
 
     config = {
         "tool": "gif2mc",
-        "version": "v0.3-single-frame",
+        "version": "v0.4-multiscreen-prep",
         "minecraft": "Java 1.21+",
         "namespace": namespace,
         "world_data_dir": str(world_data_dir),
         "datapack_dir": str(datapack_dir),
         "start_map": start_map,
         "end_map": end_map,
+        "usable_map_count": usable_map_count,
+        "width_maps": width_maps,
+        "height_maps": height_maps,
+        "tile_count": tile_count,
         "frame_count": frame_count,
         "frame_delay": frame_delay,
         "init_delay": 10,
@@ -476,7 +563,9 @@ def generate_datapack(
         "x": x,
         "y": y,
         "z": z,
-        "frame_entity": frame_entity if (frame_entity := ("minecraft:glow_item_frame" if use_glow_frame else "minecraft:item_frame")) else "minecraft:glow_item_frame",
+        "anchor": "bottom-left support block",
+        "tile_order": "left-to-right, top-to-bottom",
+        "frame_entity": frame_entity,
         "commands": [
             "/reload",
             f"/function {namespace}:setup",
@@ -500,16 +589,23 @@ def generate_datapack(
     print(f"datapack 文件夹:   {datapack_dir}")
     print(f"namespace:        {namespace}")
     print(f"map 范围:          map_{start_map}.dat ~ map_{end_map}.dat")
+    print(f"屏幕尺寸:           {width_maps} x {height_maps}")
+    print(f"每帧地图数量:        {tile_count}")
     print(f"帧数量:            {frame_count}")
-    print(f"坐标:              {x} {y} {z}")
+    print(f"左下角坐标:          {x} {y} {z}")
     print(f"frame-delay:       {frame_delay}")
     print("init:              2 FPS")
     print("init_f:            5 FPS")
     print(f"展示框类型:         {'glow_item_frame' if use_glow_frame else 'item_frame'}")
 
+    if len(continuous_ids) % tile_count != 0:
+        ignored_count = len(continuous_ids) - usable_map_count
+        print()
+        print(f"注意：连续 map 数量不能被 tile_count 整除，末尾 {ignored_count} 张不会参与播放。")
+
     if unused_ids:
         print()
-        print("注意：检测到后面还有 map 文件，但因为中间可能断号，本次不会播放这些：")
+        print("注意：检测到后面还有 map 文件，但因为中间可能断号，或末尾不足一帧，本次不会播放这些：")
         print(", ".join(f"map_{i}.dat" for i in unused_ids[:20]))
         if len(unused_ids) > 20:
             print("...")
@@ -535,9 +631,11 @@ def main():
     parser.add_argument("--datapack", default="out/datapack", help="数据包输出文件夹，默认 out/datapack")
     parser.add_argument("--namespace", default="gif2mc", help="数据包命名空间，默认 gif2mc")
     parser.add_argument("--start-map", type=int, default=None, help="起始 map id；默认自动使用最小 map id")
-    parser.add_argument("--x", type=int, default=0, help="展示框支撑方块 x，默认 0")
-    parser.add_argument("--y", type=int, default=-60, help="展示框支撑方块 y，默认 -60")
-    parser.add_argument("--z", type=int, default=0, help="展示框支撑方块 z，默认 0")
+    parser.add_argument("--x", type=int, default=0, help="屏幕左下角支撑方块 x，默认 0")
+    parser.add_argument("--y", type=int, default=-60, help="屏幕左下角支撑方块 y，默认 -60")
+    parser.add_argument("--z", type=int, default=0, help="屏幕左下角支撑方块 z，默认 0")
+    parser.add_argument("--width-maps", type=int, default=1, help="屏幕宽度，单位为地图/展示框，默认 1")
+    parser.add_argument("--height-maps", type=int, default=1, help="屏幕高度，单位为地图/展示框，默认 1")
     parser.add_argument("--frame-delay", type=int, default=20, help="播放帧间隔 tick，20=1 FPS，2=10 FPS，默认 20")
     parser.add_argument("--use-glow-frame", choices=["true", "false"], default="true", help="是否使用发光展示框，默认 true")
     parser.add_argument("--meta-dir", default="out", help="README.txt 和 config.json 输出位置，默认 out")
@@ -560,6 +658,8 @@ def main():
     start_map = args.start_map if args.start_map is not None else detected_start_map
     namespace = args.namespace
     x, y, z = args.x, args.y, args.z
+    width_maps = args.width_maps
+    height_maps = args.height_maps
     frame_delay = args.frame_delay
     use_glow_frame = args.use_glow_frame.lower() == "true"
 
@@ -573,9 +673,11 @@ def main():
         datapack_dir = Path(ask("datapack 输出文件夹", str(datapack_dir)))
         namespace = ask("namespace", namespace)
         start_map = ask_int("起始 map id", start_map)
-        x = ask_int("展示框支撑方块 x", x)
-        y = ask_int("展示框支撑方块 y", y)
-        z = ask_int("展示框支撑方块 z", z)
+        x = ask_int("屏幕左下角支撑方块 x", x)
+        y = ask_int("屏幕左下角支撑方块 y", y)
+        z = ask_int("屏幕左下角支撑方块 z", z)
+        width_maps = ask_int("屏幕宽度 width-maps，单位为地图/展示框", width_maps)
+        height_maps = ask_int("屏幕高度 height-maps，单位为地图/展示框", height_maps)
         frame_delay = ask_int("frame-delay，20=每秒1帧，2=每秒10帧", frame_delay)
         use_glow_frame = ask_yes_no("使用发光展示框", use_glow_frame)
 
@@ -594,6 +696,8 @@ def main():
         frame_delay=frame_delay,
         use_glow_frame=use_glow_frame,
         overwrite=overwrite,
+        width_maps=width_maps,
+        height_maps=height_maps,
         meta_dir=Path(args.meta_dir),
     )
 
