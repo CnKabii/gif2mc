@@ -55,6 +55,21 @@ def ask_yes_no(prompt: str, default: bool = True) -> bool:
         print("请输入 y 或 n。")
 
 
+def ask_choice(prompt: str, default: str, choices: list[str]) -> str:
+    """
+    交互式选择。
+    直接回车则使用默认值。
+    """
+    choices_text = "/".join(choices)
+    while True:
+        value = input(f"{prompt} [{default}] ({choices_text}): ").strip().lower()
+        if not value:
+            return default
+        if value in choices:
+            return value
+        print(f"请输入以下选项之一：{choices_text}")
+
+
 def write_text(path: Path, text: str):
     """
     写入文本文件，自动创建父目录。
@@ -109,29 +124,180 @@ def get_continuous_map_ids(all_ids: list[int], start_map: int) -> list[int]:
 # 大屏幕坐标 / tile 规则
 # =========================
 
+VALID_FACINGS = ("south", "north", "east", "west", "up", "down")
+# Facing byte 规则使用 Minecraft Direction ID：
+# 0=down, 1=up, 2=north, 3=south, 4=west, 5=east
+# normal_vector 表示屏幕正面朝向。
+# frame_offset 表示展示框实体相对支撑方块的位置。
+FACING_RULES = {
+    "south": {
+        "facing_byte": 3,
+        "normal_vector": (0, 0, 1),
+        "frame_offset": (0, 0, 1),
+    },
+    "north": {
+        "facing_byte": 2,
+        "normal_vector": (0, 0, -1),
+        "frame_offset": (0, 0, -1),
+    },
+    "east": {
+        "facing_byte": 5,
+        "normal_vector": (1, 0, 0),
+        "frame_offset": (1, 0, 0),
+    },
+    "west": {
+        "facing_byte": 4,
+        "normal_vector": (-1, 0, 0),
+        "frame_offset": (-1, 0, 0),
+    },
+    "up": {
+        "facing_byte": 1,
+        "normal_vector": (0, 1, 0),
+        "frame_offset": (0, 1, 0),
+    },
+    "down": {
+        "facing_byte": 0,
+        "normal_vector": (0, -1, 0),
+        "frame_offset": (0, -1, 0),
+    },
+}
+
+TOP_DIRECTION_VECTORS = {
+    "north": (0, 0, -1),
+    "south": (0, 0, 1),
+    "east": (1, 0, 0),
+    "west": (-1, 0, 0),
+}
+
+
 def validate_screen_size(width_maps: int, height_maps: int):
     if width_maps < 1 or height_maps < 1:
         raise ValueError("width_maps 和 height_maps 必须都大于等于 1。")
 
 
-def get_tile_position(tile_index: int, width_maps: int, height_maps: int, x: int, y: int, z: int) -> tuple[int, int, int]:
-    """
-    tile 顺序：从左到右，从上到下。
+def normalize_facing(facing: str) -> str:
+    value = facing.strip().lower()
+    if value not in VALID_FACINGS:
+        raise ValueError(f"facing 必须是 {', '.join(VALID_FACINGS)} 之一。")
+    return value
 
-    x/y/z 作为屏幕左下角支撑方块坐标。
-    这样 1x1 时仍然是原来的 x y z。
-    例如 3x2：
-      tile_0 tile_1 tile_2   -> y + 1
-      tile_3 tile_4 tile_5   -> y
+
+DEFAULT_TOP_DIRECTION = "north"
+
+
+def normalize_top_direction(top_direction: str = DEFAULT_TOP_DIRECTION) -> str:
     """
+    内部固定使用的画面上边方向。
+    这个值不再暴露给用户修改，只在 facing=up/down 时用于保持稳定布局。
+    """
+    return DEFAULT_TOP_DIRECTION
+
+
+def add_vec(a: tuple[int, int, int], b: tuple[int, int, int]) -> tuple[int, int, int]:
+    return a[0] + b[0], a[1] + b[1], a[2] + b[2]
+
+
+def mul_vec(v: tuple[int, int, int], n: int) -> tuple[int, int, int]:
+    return v[0] * n, v[1] * n, v[2] * n
+
+
+def cross_vec(a: tuple[int, int, int], b: tuple[int, int, int]) -> tuple[int, int, int]:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def get_screen_axes(
+    facing: str,
+    top_direction: str = DEFAULT_TOP_DIRECTION,
+) -> tuple[tuple[int, int, int], tuple[int, int, int], int, tuple[int, int, int]]:
+    """
+    返回：col_vector、row_vector、Facing byte、frame_offset。
+
+    col_vector：画面从左到右时，支撑方块坐标如何移动。
+    row_vector：画面从下到上时，支撑方块坐标如何移动。
+
+    对于水平墙面，画面的“上方”永远是 +Y。
+    对于 facing=up/down 的地面/天花板屏幕，内部固定画面上边朝 north。
+    """
+    facing = normalize_facing(facing)
+    top_direction = normalize_top_direction(top_direction)
+
+    rule = FACING_RULES[facing]
+    normal_vector = rule["normal_vector"]
+
+    if facing in ("up", "down"):
+        row_vector = TOP_DIRECTION_VECTORS[top_direction]
+    else:
+        row_vector = (0, 1, 0)
+
+    # 以“玩家正对屏幕看到的方向”为准：画面右方 = 画面上方 × 屏幕正面朝向。
+    col_vector = cross_vec(row_vector, normal_vector)
+
+    return col_vector, row_vector, rule["facing_byte"], rule["frame_offset"]
+
+
+def get_tile_positions(
+    tile_index: int,
+    width_maps: int,
+    height_maps: int,
+    x: int,
+    y: int,
+    z: int,
+    facing: str,
+    top_direction: str = DEFAULT_TOP_DIRECTION,
+) -> tuple[tuple[int, int, int], tuple[int, int, int], int]:
+    """
+    返回：支撑方块坐标、展示框实体坐标、Facing byte。
+
+    tile 顺序：从左到右，从上到下。
+    x/y/z 是“屏幕左下角支撑方块坐标”，这里的左下角始终以玩家正对屏幕时看到的方向为准。
+
+    水平墙面：
+    facing=south：屏幕朝 +Z，横向从 x 到 x+width-1。
+    facing=north：屏幕朝 -Z，横向从 x 到 x-width+1。
+    facing=east： 屏幕朝 +X，横向从 z 到 z-width+1。
+    facing=west： 屏幕朝 -X，横向从 z 到 z+width-1。
+
+    地面/天花板：
+    facing=up：屏幕朝 +Y，展示框在支撑方块上方。
+    facing=down：屏幕朝 -Y，展示框在支撑方块下方。
+    画面上边不再提供用户配置，内部固定朝 north。
+    """
+    col_vector, row_vector, facing_byte, frame_offset = get_screen_axes(facing, top_direction)
+
     row = tile_index // width_maps
     col = tile_index % width_maps
 
-    tile_x = x + col
-    tile_y = y + (height_maps - 1 - row)
-    tile_z = z
+    anchor = (x, y, z)
+    col_offset = mul_vec(col_vector, col)
+    row_offset = mul_vec(row_vector, height_maps - 1 - row)
 
-    return tile_x, tile_y, tile_z
+    support_pos = add_vec(add_vec(anchor, col_offset), row_offset)
+    frame_pos = add_vec(support_pos, frame_offset)
+
+    return support_pos, frame_pos, facing_byte
+
+
+def format_pos(pos: tuple[int, int, int]) -> str:
+    return f"{pos[0]} {pos[1]} {pos[2]}"
+
+
+def make_orientation_note(facing: str, top_direction: str = DEFAULT_TOP_DIRECTION) -> str:
+    facing = normalize_facing(facing)
+    top_direction = normalize_top_direction(top_direction)
+
+    notes = {
+        "south": "屏幕朝 south/+Z；玩家站在南侧看，画面从西到东铺开。",
+        "north": "屏幕朝 north/-Z；玩家站在北侧看，画面从东到西铺开。",
+        "east": "屏幕朝 east/+X；玩家站在东侧看，画面从南到北铺开。",
+        "west": "屏幕朝 west/-X；玩家站在西侧看，画面从北到南铺开。",
+        "up": "屏幕朝 up/+Y；玩家从上往下看。",
+        "down": "屏幕朝 down/-Y；玩家从下往上看。",
+    }
+    return notes[facing]
 
 
 # =========================
@@ -197,6 +363,7 @@ def generate_basic_functions(
     use_glow_frame: bool,
     width_maps: int,
     height_maps: int,
+    facing: str,
 ):
     """
     生成 mcfunction 文件。
@@ -217,6 +384,9 @@ def generate_basic_functions(
 
     frame_entity = "minecraft:glow_item_frame" if use_glow_frame else "minecraft:item_frame"
     tile_count = width_maps * height_maps
+    facing = normalize_facing(facing)
+    top_direction = normalize_top_direction()
+    orientation_note = make_orientation_note(facing)
 
     # internal/load.mcfunction
     load_content = f"""# {namespace}:internal/load
@@ -241,23 +411,24 @@ scoreboard objectives add {namespace}.frame dummy
         f"scoreboard players set #frame {namespace}.frame 0",
         "",
         f"# 屏幕尺寸：{width_maps} x {height_maps}，每帧 {tile_count} 张地图",
-        "# x/y/z 是屏幕左下角支撑方块坐标",
+        "# x/y/z 是屏幕左下角支撑方块坐标，左下角以玩家正对屏幕看到的方向为准",
+        f"# facing：{facing}，{orientation_note}",
         "",
         "# 清理旧展示框",
         f"kill @e[type={frame_entity},tag={namespace}.screen]",
         "",
         "# 生成支撑方块和展示框",
         "# tile 顺序：从左到右，从上到下",
-        "# 注意：Facing 方向后面可能需要根据实际朝向调整",
     ]
 
     for tile_index in range(tile_count):
-        tile_x, tile_y, tile_z = get_tile_position(tile_index, width_maps, height_maps, x, y, z)
+        support_pos, frame_pos, facing_byte = get_tile_positions(tile_index, width_maps, height_maps, x, y, z, facing, top_direction)
         initial_map_id = start_map + tile_index
-        setup_lines.append(f"setblock {tile_x} {tile_y} {tile_z} minecraft:barrier")
+        setup_lines.append(f"# tile_{tile_index}: support {format_pos(support_pos)} -> frame {format_pos(frame_pos)}")
+        setup_lines.append(f"setblock {format_pos(support_pos)} minecraft:barrier")
         setup_lines.append(
-            f'summon {frame_entity} {tile_x} {tile_y} {tile_z + 1} '
-            f'{{Tags:["{namespace}.screen","{namespace}.tile_{tile_index}"],Facing:3b,'
+            f'summon {frame_entity} {format_pos(frame_pos)} '
+            f'{{Tags:["{namespace}.screen","{namespace}.tile_{tile_index}"],Facing:{facing_byte}b,'
             f'Item:{{id:"minecraft:filled_map",count:1,components:{{"minecraft:map_id":{initial_map_id}}}}}}}'
         )
 
@@ -426,10 +597,12 @@ def make_output_readme(config: dict) -> str:
 - init: 2 FPS 预载，扫完后回到第一帧并暂停
 - init_f: 5 FPS 预载，扫完后回到第一帧并暂停
 - 屏幕左下角支撑方块坐标: {config['x']} {config['y']} {config['z']}
+- 屏幕朝向 facing: {config['facing']}
+- 朝向说明: {config['orientation_note']}
 - 展示框类型: {config['frame_entity']}
 
 大屏幕 map_id 规则
-- tile 顺序：从左到右，从上到下
+- tile 顺序：从左到右，从上到下，以玩家正对屏幕看到的方向为准
 - 第 frame 帧、第 tile 块：map_id = start_map + frame * tile_count + tile
 - 例如 3x2 屏幕：
   tile_0 tile_1 tile_2
@@ -480,9 +653,13 @@ def generate_datapack(
     overwrite: bool,
     width_maps: int = 1,
     height_maps: int = 1,
+    facing: str = "south",
     meta_dir: Path | None = None,
 ):
     validate_screen_size(width_maps, height_maps)
+    facing = normalize_facing(facing)
+    top_direction = normalize_top_direction()
+    orientation_note = make_orientation_note(facing)
     tile_count = width_maps * height_maps
 
     all_ids = scan_map_ids(world_data_dir)
@@ -539,13 +716,14 @@ def generate_datapack(
         use_glow_frame=use_glow_frame,
         width_maps=width_maps,
         height_maps=height_maps,
+        facing=facing,
     )
 
     frame_entity = "minecraft:glow_item_frame" if use_glow_frame else "minecraft:item_frame"
 
     config = {
         "tool": "gif2mc",
-        "version": "v0.4-multiscreen-prep",
+        "version": "v0.6-facing",
         "minecraft": "Java 1.21+",
         "namespace": namespace,
         "world_data_dir": str(world_data_dir),
@@ -556,6 +734,8 @@ def generate_datapack(
         "width_maps": width_maps,
         "height_maps": height_maps,
         "tile_count": tile_count,
+        "facing": facing,
+        "orientation_note": orientation_note,
         "frame_count": frame_count,
         "frame_delay": frame_delay,
         "init_delay": 10,
@@ -593,6 +773,8 @@ def generate_datapack(
     print(f"每帧地图数量:        {tile_count}")
     print(f"帧数量:            {frame_count}")
     print(f"左下角坐标:          {x} {y} {z}")
+    print(f"屏幕朝向:            {facing}")
+    print(f"朝向说明:            {orientation_note}")
     print(f"frame-delay:       {frame_delay}")
     print("init:              2 FPS")
     print("init_f:            5 FPS")
@@ -636,6 +818,7 @@ def main():
     parser.add_argument("--z", type=int, default=0, help="屏幕左下角支撑方块 z，默认 0")
     parser.add_argument("--width-maps", type=int, default=1, help="屏幕宽度，单位为地图/展示框，默认 1")
     parser.add_argument("--height-maps", type=int, default=1, help="屏幕高度，单位为地图/展示框，默认 1")
+    parser.add_argument("--facing", choices=VALID_FACINGS, default="south", help="屏幕朝向，默认 south。可选 south/north/east/west/up/down")
     parser.add_argument("--frame-delay", type=int, default=20, help="播放帧间隔 tick，20=1 FPS，2=10 FPS，默认 20")
     parser.add_argument("--use-glow-frame", choices=["true", "false"], default="true", help="是否使用发光展示框，默认 true")
     parser.add_argument("--meta-dir", default="out", help="README.txt 和 config.json 输出位置，默认 out")
@@ -660,6 +843,7 @@ def main():
     x, y, z = args.x, args.y, args.z
     width_maps = args.width_maps
     height_maps = args.height_maps
+    facing = args.facing
     frame_delay = args.frame_delay
     use_glow_frame = args.use_glow_frame.lower() == "true"
 
@@ -678,6 +862,7 @@ def main():
         z = ask_int("屏幕左下角支撑方块 z", z)
         width_maps = ask_int("屏幕宽度 width-maps，单位为地图/展示框", width_maps)
         height_maps = ask_int("屏幕高度 height-maps，单位为地图/展示框", height_maps)
+        facing = ask_choice("屏幕朝向 facing", facing, list(VALID_FACINGS))
         frame_delay = ask_int("frame-delay，20=每秒1帧，2=每秒10帧", frame_delay)
         use_glow_frame = ask_yes_no("使用发光展示框", use_glow_frame)
 
@@ -698,6 +883,7 @@ def main():
         overwrite=overwrite,
         width_maps=width_maps,
         height_maps=height_maps,
+        facing=facing,
         meta_dir=Path(args.meta_dir),
     )
 

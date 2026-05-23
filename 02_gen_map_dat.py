@@ -10,16 +10,18 @@
 
 常用：
   直接双击或运行：python genDat.py
-  脚本会询问 start-index、x-center、z-center、是否清理旧 map 文件。
-  也仍然支持命令行参数，例如：genDat.py --start-index 0 --x-center 0
+  脚本会询问 start-index、x-center、z-center、并行进程数、是否清理旧 map 文件。
+  也仍然支持命令行参数，例如：python 02_gen_map_dat.py --start-index 0 --x-center 0 --workers 8 --yes
 """
 
 from __future__ import annotations
 
 import argparse
 import gzip
+import os
 import re
 import struct
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
@@ -200,9 +202,10 @@ def make_idcounts_dat(next_map_id: int) -> bytes:
     return root_compound(payload)
 
 
-def gzip_write(path: Path, raw_nbt: bytes) -> None:
+def gzip_write(path: Path, raw_nbt: bytes, compresslevel: int = 1) -> None:
+    """写入 gzip 压缩的 NBT。compresslevel 越低越快，越高文件越小。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(path, "wb", compresslevel=9) as f:
+    with gzip.open(path, "wb", compresslevel=compresslevel) as f:
         f.write(raw_nbt)
 
 
@@ -213,6 +216,80 @@ def collect_images(input_dir: Path, patterns: Iterable[str]) -> list[Path]:
     # 去重后自然排序
     unique = sorted(set(images), key=natural_key)
     return [p for p in unique if p.is_file()]
+
+
+def auto_worker_count() -> int:
+    """自动选择并行进程数：尽量留 1 个核心给系统。"""
+    cpu_count = os.cpu_count() or 1
+    return max(1, cpu_count - 1)
+
+
+def convert_one_frame_job(job: tuple[int, str, int, str, int, int, str, int]) -> tuple[int, str, str]:
+    """
+    单张图片 -> map_N.dat。
+
+    这是给 ProcessPoolExecutor 调用的顶层函数，Windows 下也能正常 pickle。
+    返回：index, 输入文件名, 输出文件名。
+    """
+    index, frame_path_str, map_id, output_dir_str, x_center, z_center, dimension, gzip_level = job
+
+    frame_path = Path(frame_path_str)
+    output_dir = Path(output_dir_str)
+
+    colors = image_to_map_colors(frame_path)
+    raw_map_nbt = make_map_dat(colors, x_center, z_center, dimension)
+    out_path = output_dir / f"map_{map_id}.dat"
+    gzip_write(out_path, raw_map_nbt, compresslevel=gzip_level)
+
+    return index, frame_path.name, out_path.name
+
+
+def print_progress(done: int, total: int, frame_name: str, out_name: str) -> None:
+    """控制进度输出频率，避免上万张图时刷屏拖慢速度。"""
+    if done == 1 or done == total or done % 100 == 0:
+        print(f"[{done:>5}/{total}] {frame_name} -> {out_name}")
+
+
+def convert_frames_to_maps(
+    frames: list[Path],
+    output_dir: Path,
+    start_index: int,
+    x_center: int,
+    z_center: int,
+    dimension: str,
+    workers: int,
+    gzip_level: int,
+) -> None:
+    """把图片序列转换成 map_*.dat。workers=1 时使用单进程，workers>1 时使用多进程。"""
+    total = len(frames)
+
+    jobs = [
+        (
+            index,
+            str(frame_path),
+            start_index + index,
+            str(output_dir),
+            x_center,
+            z_center,
+            dimension,
+            gzip_level,
+        )
+        for index, frame_path in enumerate(frames)
+    ]
+
+    if workers <= 1:
+        for done, job in enumerate(jobs, start=1):
+            _, frame_name, out_name = convert_one_frame_job(job)
+            print_progress(done, total, frame_name, out_name)
+        return
+
+    completed = 0
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(convert_one_frame_job, job) for job in jobs]
+        for future in as_completed(futures):
+            _, frame_name, out_name = future.result()
+            completed += 1
+            print_progress(completed, total, frame_name, out_name)
 
 
 
@@ -227,6 +304,38 @@ def ask_int(prompt: str, default: int) -> int:
         except ValueError:
             print("请输入整数，或者直接回车使用默认值。")
 
+
+
+def ask_workers(prompt: str, default: int) -> int:
+    """交互式询问并行进程数；0 表示自动。"""
+    while True:
+        raw = input(f"{prompt} [{default}，0=自动]: ").strip()
+        if raw == "":
+            return default
+        try:
+            value = int(raw)
+            if value < 0:
+                print("请输入 0 或正整数。")
+                continue
+            return value
+        except ValueError:
+            print("请输入整数，或者直接回车使用默认值。")
+
+
+def ask_gzip_level(prompt: str, default: int) -> int:
+    """交互式询问 gzip 压缩等级。1 最快，9 最小。"""
+    while True:
+        raw = input(f"{prompt} [{default}，1=最快，9=最小]: ").strip()
+        if raw == "":
+            return default
+        try:
+            value = int(raw)
+            if not 1 <= value <= 9:
+                print("请输入 1 到 9 之间的整数。")
+                continue
+            return value
+        except ValueError:
+            print("请输入整数，或者直接回车使用默认值。")
 
 
 def ask_bool(prompt: str, default: bool) -> bool:
@@ -264,6 +373,20 @@ def main() -> None:
         help="不删除输出目录里已有的 map_*.dat。默认会清理旧 map 文件，避免残留。",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="并行进程数。0=自动使用 CPU 核心数 - 1；1=单进程。默认 0。",
+    )
+    parser.add_argument(
+        "--gzip-level",
+        type=int,
+        default=1,
+        choices=range(1, 10),
+        metavar="1-9",
+        help="gzip 压缩等级。1=最快，9=文件最小。默认 1。",
+    )
+    parser.add_argument(
         "--yes",
         action="store_true",
         help="非交互模式：不询问，直接使用命令行参数/默认值。",
@@ -282,6 +405,8 @@ def main() -> None:
         args.start_index = ask_int("起始地图编号 start-index", args.start_index)
         args.x_center = ask_int("地图中心 x-center", args.x_center)
         args.z_center = ask_int("地图中心 z-center", args.z_center)
+        args.workers = ask_workers("并行进程数 workers", args.workers)
+        args.gzip_level = ask_gzip_level("gzip 压缩等级 gzip-level", args.gzip_level)
         clean_old = ask_bool("生成前清理输出目录里旧的 map_*.dat", not args.no_clean)
         args.no_clean = not clean_old
         print()
@@ -299,21 +424,29 @@ def main() -> None:
         for old_map in output_dir.glob("map_*.dat"):
             old_map.unlink()
 
+    workers = auto_worker_count() if args.workers == 0 else args.workers
+    workers = max(1, workers)
+
     print(f"输入目录：{input_dir}")
     print(f"输出目录：{output_dir}")
     print(f"帧数量：{len(frames)}")
     print(f"地图编号：map_{args.start_index}.dat 到 map_{args.start_index + len(frames) - 1}.dat")
+    print(f"并行进程：{workers}")
+    print(f"gzip 等级：{args.gzip_level}")
 
-    for index, frame_path in enumerate(frames):
-        map_id = args.start_index + index
-        colors = image_to_map_colors(frame_path)
-        raw_map_nbt = make_map_dat(colors, args.x_center, args.z_center, "minecraft:overworld")
-        out_path = output_dir / f"map_{map_id}.dat"
-        gzip_write(out_path, raw_map_nbt)
-        print(f"[{index + 1:>4}/{len(frames)}] {frame_path.name} -> {out_path.name}")
+    convert_frames_to_maps(
+        frames=frames,
+        output_dir=output_dir,
+        start_index=args.start_index,
+        x_center=args.x_center,
+        z_center=args.z_center,
+        dimension="minecraft:overworld",
+        workers=workers,
+        gzip_level=args.gzip_level,
+    )
 
     next_map_id = args.start_index + len(frames)
-    gzip_write(output_dir / "idcounts.dat", make_idcounts_dat(next_map_id))
+    gzip_write(output_dir / "idcounts.dat", make_idcounts_dat(next_map_id), compresslevel=args.gzip_level)
     print(f"已生成 idcounts.dat，data.map = {next_map_id}")
 
 
