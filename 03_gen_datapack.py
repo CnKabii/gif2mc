@@ -125,6 +125,9 @@ def get_continuous_map_ids(all_ids: list[int], start_map: int) -> list[int]:
 # =========================
 
 VALID_FACINGS = ("south", "north", "east", "west", "up", "down")
+LOAD_FRAME_CHUNK_SIZE = 5000
+PRELOAD_PRO_SIZE = 16
+PRELOAD_MAX_SIZE = 32
 # Facing byte 规则使用 Minecraft Direction ID：
 # 0=down, 1=up, 2=north, 3=south, 4=west, 5=east
 # normal_vector 表示屏幕正面朝向。
@@ -369,10 +372,10 @@ def generate_basic_functions(
     生成 mcfunction 文件。
 
     根目录只保留用户常用函数：
-    setup / init / init_f / start / pause / restart
+    setup / init / init_f / init_pro / init_max / int_max / start / pause / restart
 
     内部函数全部放入 internal/：
-    load / tick / next / load_frame / init_next / init_finish
+    load / tick / next / load_frame / init_next / init_finish / preload/*
 
     大屏幕规则：
     - width_maps * height_maps = 每帧 tile 数量
@@ -381,12 +384,90 @@ def generate_basic_functions(
     """
     function_dir = datapack_dir / "data" / namespace / "function"
     internal_dir = function_dir / "internal"
+    preload_dir = internal_dir / "preload"
 
     frame_entity = "minecraft:glow_item_frame" if use_glow_frame else "minecraft:item_frame"
     tile_count = width_maps * height_maps
+    usable_map_count = frame_count * tile_count
     facing = normalize_facing(facing)
     top_direction = normalize_top_direction()
     orientation_note = make_orientation_note(facing)
+
+    # 临时预载屏幕放在正式屏幕“右侧”并留 2 格间隔，尽量避免覆盖正式屏幕。
+    col_vector, _, _, _ = get_screen_axes(facing, top_direction)
+    preload_anchor = add_vec((x, y, z), mul_vec(col_vector, width_maps + 2))
+
+    def make_preload_setup(size: int) -> str:
+        lines = [
+            f"# {namespace}:internal/preload/setup_{size}",
+            f"# 内部函数：生成 {size}x{size} 临时预载屏幕",
+            f"# 预载屏幕锚点：{format_pos(preload_anchor)}",
+            "",
+            f"kill @e[type={frame_entity},tag={namespace}.preload]",
+            "",
+        ]
+        for tile_index in range(size * size):
+            support_pos, frame_pos, facing_byte = get_tile_positions(
+                tile_index,
+                size,
+                size,
+                preload_anchor[0],
+                preload_anchor[1],
+                preload_anchor[2],
+                facing,
+                top_direction,
+            )
+            lines.append(f"# preload_tile_{tile_index}: support {format_pos(support_pos)} -> frame {format_pos(frame_pos)}")
+            lines.append(f"setblock {format_pos(support_pos)} minecraft:barrier")
+            lines.append(
+                f'summon {frame_entity} {format_pos(frame_pos)} '
+                f'{{Tags:["{namespace}.preload","{namespace}.preload_tile_{tile_index}"],Facing:{facing_byte}b,'
+                f'Item:{{id:"minecraft:filled_map",count:1,components:{{"minecraft:map_id":{start_map}}}}}}}'
+            )
+        return "\n".join(lines) + "\n"
+
+    def make_preload_clear(size: int) -> str:
+        lines = [
+            f"# {namespace}:internal/preload/clear_{size}",
+            f"# 内部函数：删除 {size}x{size} 临时预载屏幕",
+            "",
+            f"kill @e[type={frame_entity},tag={namespace}.preload]",
+            "",
+        ]
+        for tile_index in range(size * size):
+            support_pos, _, _ = get_tile_positions(
+                tile_index,
+                size,
+                size,
+                preload_anchor[0],
+                preload_anchor[1],
+                preload_anchor[2],
+                facing,
+                top_direction,
+            )
+            lines.append(f"setblock {format_pos(support_pos)} minecraft:air")
+        return "\n".join(lines) + "\n"
+
+    def make_preload_load(name: str, size: int) -> str:
+        preload_tile_count = size * size
+        lines = [
+            f"# {namespace}:internal/preload/load_{name}",
+            f"# 内部函数：根据 #preload_index，把 {size}x{size} 预载屏幕切换到当前批次地图",
+            f"# 每批最多 {preload_tile_count} 张地图",
+            "",
+        ]
+        for batch_start in range(0, usable_map_count, preload_tile_count):
+            batch_end = min(batch_start + preload_tile_count, usable_map_count)
+            lines.append(f"# batch map offset {batch_start}..{batch_end - 1}")
+            for offset in range(batch_start, batch_end):
+                tile_index = offset - batch_start
+                map_id = start_map + offset
+                lines.append(
+                    f'execute if score #preload_index {namespace}.preload matches {batch_start} '
+                    f'run data merge entity @e[type={frame_entity},tag={namespace}.preload_tile_{tile_index},limit=1,sort=nearest] '
+                    f'{{Item:{{id:"minecraft:filled_map",count:1,components:{{"minecraft:map_id":{map_id}}}}}}}'
+                )
+        return "\n".join(lines) + "\n"
 
     # internal/load.mcfunction
     load_content = f"""# {namespace}:internal/load
@@ -397,6 +478,7 @@ def generate_basic_functions(
 scoreboard objectives add {namespace}.state dummy
 scoreboard objectives add {namespace}.timer dummy
 scoreboard objectives add {namespace}.frame dummy
+scoreboard objectives add {namespace}.preload dummy
 """
 
     # setup.mcfunction
@@ -409,6 +491,7 @@ scoreboard objectives add {namespace}.frame dummy
         f"scoreboard players set #playing {namespace}.state 0",
         f"scoreboard players set #timer {namespace}.timer 0",
         f"scoreboard players set #frame {namespace}.frame 0",
+        f"scoreboard players set #preload_index {namespace}.preload 0",
         "",
         f"# 屏幕尺寸：{width_maps} x {height_maps}，每帧 {tile_count} 张地图",
         "# x/y/z 是屏幕左下角支撑方块坐标，左下角以玩家正对屏幕看到的方向为准",
@@ -416,6 +499,7 @@ scoreboard objectives add {namespace}.frame dummy
         "",
         "# 清理旧展示框",
         f"kill @e[type={frame_entity},tag={namespace}.screen]",
+        f"kill @e[type={frame_entity},tag={namespace}.preload]",
         "",
         "# 生成支撑方块和展示框",
         "# tile 顺序：从左到右，从上到下",
@@ -439,7 +523,7 @@ scoreboard objectives add {namespace}.frame dummy
     ])
     setup_content = "\n".join(setup_lines)
 
-    # init.mcfunction：2 FPS 预载
+    # init.mcfunction：2 FPS 预载正式屏幕
     init_content = f"""# {namespace}:init
 # 用户函数：慢速预载所有地图，默认 2 FPS
 # 效果：从第一帧慢速播放一次，结束后回到第一帧并暂停
@@ -452,7 +536,7 @@ scoreboard players set #init_delay {namespace}.timer 10
 function {namespace}:internal/load_frame
 """
 
-    # init_f.mcfunction：5 FPS 预载
+    # init_f.mcfunction：5 FPS 预载正式屏幕
     init_f_content = f"""# {namespace}:init_f
 # 用户函数：快速预载所有地图，默认 5 FPS
 # 效果：从第一帧较快播放一次，结束后回到第一帧并暂停
@@ -463,6 +547,45 @@ scoreboard players set #frame {namespace}.frame 0
 scoreboard players set #init_delay {namespace}.timer 4
 
 function {namespace}:internal/load_frame
+"""
+
+    # init_pro.mcfunction：16x16 临时屏幕，2 FPS 预载
+    init_pro_content = f"""# {namespace}:init_pro
+# 用户函数：生成 16x16 临时预载屏幕，以 2 FPS 批量预载地图
+# 完成后自动删除临时预载屏幕，并回到暂停状态
+
+function {namespace}:internal/load
+function {namespace}:internal/preload/setup_16
+
+scoreboard players set #playing {namespace}.state 3
+scoreboard players set #timer {namespace}.timer 0
+scoreboard players set #preload_index {namespace}.preload 0
+scoreboard players set #preload_delay {namespace}.preload 10
+
+function {namespace}:internal/preload/load_pro
+"""
+
+    # init_max.mcfunction：32x32 临时屏幕，1 FPS 预载
+    init_max_content = f"""# {namespace}:init_max
+# 用户函数：生成 32x32 临时预载屏幕，以 1 FPS 批量预载地图
+# 完成后自动删除临时预载屏幕，并回到暂停状态
+
+function {namespace}:internal/load
+function {namespace}:internal/preload/setup_32
+
+scoreboard players set #playing {namespace}.state 4
+scoreboard players set #timer {namespace}.timer 0
+scoreboard players set #preload_index {namespace}.preload 0
+scoreboard players set #preload_delay {namespace}.preload 20
+
+function {namespace}:internal/preload/load_max
+"""
+
+    # int_max.mcfunction：兼容旧名字，转到 init_max
+    int_max_content = f"""# {namespace}:int_max
+# 用户函数：兼容旧名字，等同于 /function {namespace}:init_max
+
+function {namespace}:init_max
 """
 
     # start.mcfunction
@@ -496,6 +619,8 @@ function {namespace}:internal/load_frame
 # state 0 = 暂停
 # state 1 = 正常播放
 # state 2 = init 预载模式
+# state 3 = init_pro 16x16 临时预载模式
+# state 4 = int_max 32x32 临时预载模式
 
 # 正常播放模式：按 frame-delay 切换下一帧
 execute if score #playing {namespace}.state matches 1 run scoreboard players add #timer {namespace}.timer 1
@@ -504,6 +629,12 @@ execute if score #playing {namespace}.state matches 1 if score #timer {namespace
 # init 预载模式：按 #init_delay 指定的速度慢速扫一遍所有帧
 execute if score #playing {namespace}.state matches 2 run scoreboard players add #timer {namespace}.timer 1
 execute if score #playing {namespace}.state matches 2 if score #timer {namespace}.timer >= #init_delay {namespace}.timer run function {namespace}:internal/init_next
+
+# init_pro / int_max 临时预载模式
+execute if score #playing {namespace}.state matches 3 run scoreboard players add #timer {namespace}.timer 1
+execute if score #playing {namespace}.state matches 3 if score #timer {namespace}.timer >= #preload_delay {namespace}.preload run function {namespace}:internal/preload/next_pro
+execute if score #playing {namespace}.state matches 4 run scoreboard players add #timer {namespace}.timer 1
+execute if score #playing {namespace}.state matches 4 if score #timer {namespace}.timer >= #preload_delay {namespace}.preload run function {namespace}:internal/preload/next_max
 """
 
     # internal/next.mcfunction
@@ -543,31 +674,101 @@ scoreboard players set #frame {namespace}.frame 0
 function {namespace}:internal/load_frame
 """
 
+    # internal/preload/next_pro.mcfunction
+    next_pro_content = f"""# {namespace}:internal/preload/next_pro
+# 内部函数：16x16 临时预载屏幕切换到下一批地图
+
+scoreboard players set #timer {namespace}.timer 0
+scoreboard players add #preload_index {namespace}.preload 256
+
+execute if score #preload_index {namespace}.preload matches {usable_map_count}.. run function {namespace}:internal/preload/finish_16
+execute unless score #preload_index {namespace}.preload matches {usable_map_count}.. run function {namespace}:internal/preload/load_pro
+"""
+
+    # internal/preload/next_max.mcfunction
+    next_max_content = f"""# {namespace}:internal/preload/next_max
+# 内部函数：32x32 临时预载屏幕切换到下一批地图
+
+scoreboard players set #timer {namespace}.timer 0
+scoreboard players add #preload_index {namespace}.preload 1024
+
+execute if score #preload_index {namespace}.preload matches {usable_map_count}.. run function {namespace}:internal/preload/finish_32
+execute unless score #preload_index {namespace}.preload matches {usable_map_count}.. run function {namespace}:internal/preload/load_max
+"""
+
+    finish_16_content = f"""# {namespace}:internal/preload/finish_16
+# 内部函数：结束 16x16 临时预载，删除临时屏幕
+
+scoreboard players set #playing {namespace}.state 0
+scoreboard players set #timer {namespace}.timer 0
+scoreboard players set #preload_index {namespace}.preload 0
+function {namespace}:internal/preload/clear_16
+function {namespace}:internal/load_frame
+"""
+
+    finish_32_content = f"""# {namespace}:internal/preload/finish_32
+# 内部函数：结束 32x32 临时预载，删除临时屏幕
+
+scoreboard players set #playing {namespace}.state 0
+scoreboard players set #timer {namespace}.timer 0
+scoreboard players set #preload_index {namespace}.preload 0
+function {namespace}:internal/preload/clear_32
+function {namespace}:internal/load_frame
+"""
+
     # internal/load_frame.mcfunction
-    lines = [
+    # 分发器：只负责根据当前 #frame 调用对应的分段文件。
+    # 真正的换图命令写入 internal/frames/ 下的分段函数，避免单个 load_frame.mcfunction 过大。
+    load_frame_lines = [
         f"# {namespace}:internal/load_frame",
         "# 内部函数：根据当前 #frame，把所有展示框里的 filled_map 切换到对应 map_id",
+        "# 这是分发器；实际换图命令位于 internal/frames/",
+        f"# 每个分段文件最多包含 {LOAD_FRAME_CHUNK_SIZE} 帧",
         f"# map_id = {start_map} + frame_index * {tile_count} + tile_index",
         "# tile 顺序：从左到右，从上到下",
         ""
     ]
 
-    for frame_index in range(frame_count):
-        for tile_index in range(tile_count):
-            map_id = start_map + frame_index * tile_count + tile_index
-            line = (
-                f'execute if score #frame {namespace}.frame matches {frame_index} '
-                f'run data merge entity @e[type={frame_entity},tag={namespace}.tile_{tile_index},limit=1,sort=nearest] '
-                f'{{Item:{{id:"minecraft:filled_map",count:1,components:{{"minecraft:map_id":{map_id}}}}}}}'
-            )
-            lines.append(line)
+    frame_chunks: list[tuple[int, int, str]] = []
+    for chunk_start in range(0, frame_count, LOAD_FRAME_CHUNK_SIZE):
+        chunk_end = min(chunk_start + LOAD_FRAME_CHUNK_SIZE - 1, frame_count - 1)
+        chunk_name = f"load_frame_{chunk_start:06d}_{chunk_end:06d}"
+        frame_chunks.append((chunk_start, chunk_end, chunk_name))
+        load_frame_lines.append(
+            f"execute if score #frame {namespace}.frame matches {chunk_start}..{chunk_end} "
+            f"run function {namespace}:internal/frames/{chunk_name}"
+        )
 
-    load_frame_content = "\n".join(lines) + "\n"
+    load_frame_content = "\n".join(load_frame_lines) + "\n"
+
+    frame_chunk_contents: dict[str, str] = {}
+    for chunk_start, chunk_end, chunk_name in frame_chunks:
+        lines = [
+            f"# {namespace}:internal/frames/{chunk_name}",
+            f"# 分段帧范围：{chunk_start}..{chunk_end}",
+            f"# map_id = {start_map} + frame_index * {tile_count} + tile_index",
+            ""
+        ]
+
+        for frame_index in range(chunk_start, chunk_end + 1):
+            for tile_index in range(tile_count):
+                map_id = start_map + frame_index * tile_count + tile_index
+                line = (
+                    f'execute if score #frame {namespace}.frame matches {frame_index} '
+                    f'run data merge entity @e[type={frame_entity},tag={namespace}.tile_{tile_index},limit=1,sort=nearest] '
+                    f'{{Item:{{id:"minecraft:filled_map",count:1,components:{{"minecraft:map_id":{map_id}}}}}}}'
+                )
+                lines.append(line)
+
+        frame_chunk_contents[chunk_name] = "\n".join(lines) + "\n"
 
     # 用户函数
     write_text(function_dir / "setup.mcfunction", setup_content)
     write_text(function_dir / "init.mcfunction", init_content)
     write_text(function_dir / "init_f.mcfunction", init_f_content)
+    write_text(function_dir / "init_pro.mcfunction", init_pro_content)
+    write_text(function_dir / "init_max.mcfunction", init_max_content)
+    write_text(function_dir / "int_max.mcfunction", int_max_content)
     write_text(function_dir / "start.mcfunction", start_content)
     write_text(function_dir / "pause.mcfunction", pause_content)
     write_text(function_dir / "restart.mcfunction", restart_content)
@@ -579,8 +780,20 @@ function {namespace}:internal/load_frame
     write_text(internal_dir / "init_next.mcfunction", init_next_content)
     write_text(internal_dir / "init_finish.mcfunction", init_finish_content)
     write_text(internal_dir / "load_frame.mcfunction", load_frame_content)
+    for chunk_name, chunk_content in frame_chunk_contents.items():
+        write_text(internal_dir / "frames" / f"{chunk_name}.mcfunction", chunk_content)
 
-
+    # 临时预载屏幕函数
+    write_text(preload_dir / "setup_16.mcfunction", make_preload_setup(16))
+    write_text(preload_dir / "setup_32.mcfunction", make_preload_setup(32))
+    write_text(preload_dir / "clear_16.mcfunction", make_preload_clear(16))
+    write_text(preload_dir / "clear_32.mcfunction", make_preload_clear(32))
+    write_text(preload_dir / "load_pro.mcfunction", make_preload_load("pro", 16))
+    write_text(preload_dir / "load_max.mcfunction", make_preload_load("max", 32))
+    write_text(preload_dir / "next_pro.mcfunction", next_pro_content)
+    write_text(preload_dir / "next_max.mcfunction", next_max_content)
+    write_text(preload_dir / "finish_16.mcfunction", finish_16_content)
+    write_text(preload_dir / "finish_32.mcfunction", finish_32_content)
 
 def make_output_readme(config: dict) -> str:
     namespace = config["namespace"]
@@ -596,6 +809,9 @@ def make_output_readme(config: dict) -> str:
 - 播放 frame-delay: {config['frame_delay']} tick
 - init: 2 FPS 预载，扫完后回到第一帧并暂停
 - init_f: 5 FPS 预载，扫完后回到第一帧并暂停
+- init_pro: 16x16 临时屏幕，2 FPS 批量预载，完成后自动消除
+- init_max: 32x32 临时屏幕，1 FPS 批量预载，完成后自动消除
+- int_max: init_max 的兼容别名
 - 屏幕左下角支撑方块坐标: {config['x']} {config['y']} {config['z']}
 - 屏幕朝向 facing: {config['facing']}
 - 朝向说明: {config['orientation_note']}
@@ -621,6 +837,9 @@ def make_output_readme(config: dict) -> str:
 /function {namespace}:setup
 /function {namespace}:init
 /function {namespace}:init_f
+/function {namespace}:init_pro
+/function {namespace}:init_max
+/function {namespace}:int_max
 /function {namespace}:start
 /function {namespace}:pause
 /function {namespace}:restart
@@ -629,6 +848,9 @@ def make_output_readme(config: dict) -> str:
 setup   创建屏幕并显示第一帧
 init    2 FPS 慢速预载一遍，完成后回到第一帧并暂停
 init_f  5 FPS 快速预载一遍，完成后回到第一帧并暂停
+init_pro 生成 16x16 临时屏幕，以 2 FPS 批量预载，完成后自动消除
+init_max 生成 32x32 临时屏幕，以 1 FPS 批量预载，完成后自动消除
+int_max  init_max 的兼容别名
 start   开始正常播放
 pause   暂停播放
 restart 从第一帧重新开始正常播放
@@ -734,6 +956,13 @@ def generate_datapack(
         "width_maps": width_maps,
         "height_maps": height_maps,
         "tile_count": tile_count,
+        "load_frame_chunk_size": LOAD_FRAME_CHUNK_SIZE,
+        "init_pro_size": "16x16",
+        "init_pro_delay": 10,
+        "init_max_size": "32x32",
+        "int_max_size": "32x32",
+        "init_max_delay": 20,
+        "int_max_delay": 20,
         "facing": facing,
         "orientation_note": orientation_note,
         "frame_count": frame_count,
@@ -751,6 +980,9 @@ def generate_datapack(
             f"/function {namespace}:setup",
             f"/function {namespace}:init",
             f"/function {namespace}:init_f",
+            f"/function {namespace}:init_pro",
+            f"/function {namespace}:init_max",
+            f"/function {namespace}:int_max",
             f"/function {namespace}:start",
             f"/function {namespace}:pause",
             f"/function {namespace}:restart",
@@ -778,6 +1010,9 @@ def generate_datapack(
     print(f"frame-delay:       {frame_delay}")
     print("init:              2 FPS")
     print("init_f:            5 FPS")
+    print("init_pro:          16x16 临时屏幕，2 FPS")
+    print("init_max:          32x32 临时屏幕，1 FPS")
+    print("int_max:           init_max 的兼容别名")
     print(f"展示框类型:         {'glow_item_frame' if use_glow_frame else 'item_frame'}")
 
     if len(continuous_ids) % tile_count != 0:
@@ -798,6 +1033,9 @@ def generate_datapack(
     print(f"/function {namespace}:setup")
     print(f"/function {namespace}:init")
     print(f"/function {namespace}:init_f")
+    print(f"/function {namespace}:init_pro")
+    print(f"/function {namespace}:init_max")
+    print(f"/function {namespace}:int_max")
     print(f"/function {namespace}:start")
     print(f"/function {namespace}:pause")
     print(f"/function {namespace}:restart")
@@ -831,14 +1069,6 @@ def main():
 
     world_data_dir = Path(args.world_data)
     datapack_dir = Path(args.datapack)
-
-    all_ids = scan_map_ids(world_data_dir)
-    if not all_ids:
-        print(f"错误：没有在 {world_data_dir} 里找到 map_*.dat")
-        return
-
-    detected_start_map = min(all_ids)
-    start_map = args.start_map if args.start_map is not None else detected_start_map
     namespace = args.namespace
     x, y, z = args.x, args.y, args.z
     width_maps = args.width_maps
@@ -848,14 +1078,26 @@ def main():
     use_glow_frame = args.use_glow_frame.lower() == "true"
 
     if not args.yes:
-        print(f"检测到 map id：{all_ids[0]} ~ {all_ids[-1]}")
-        print(f"默认起始 map id：{detected_start_map}")
         print("直接回车使用方括号里的默认值。")
         print()
-
         world_data_dir = Path(ask("world_data 文件夹", str(world_data_dir)))
         datapack_dir = Path(ask("datapack 输出文件夹", str(datapack_dir)))
         namespace = ask("namespace", namespace)
+
+    all_ids = scan_map_ids(world_data_dir)
+    if not all_ids:
+        print(f"错误：没有在 {world_data_dir} 里找到 map_*.dat")
+        return
+
+    detected_start_map = min(all_ids)
+    start_map = args.start_map if args.start_map is not None else detected_start_map
+
+    if not args.yes:
+        print()
+        print(f"检测到 map id：{all_ids[0]} ~ {all_ids[-1]}")
+        print(f"默认起始 map id：{detected_start_map}")
+        print()
+
         start_map = ask_int("起始 map id", start_map)
         x = ask_int("屏幕左下角支撑方块 x", x)
         y = ask_int("屏幕左下角支撑方块 y", y)
