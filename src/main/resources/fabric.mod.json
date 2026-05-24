@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "gif2mc",
+  "version": "${version}",
+  "name": "Gif2MC Fabric MVP",
+  "description": "A Fabric MVP mod for dynamic Minecraft map art playback.",
+  "authors": [
+    "Charlie"
+  ],
+  "contact": {},
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.gif2mc.Gif2McMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.0",
+    "minecraft": "1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
